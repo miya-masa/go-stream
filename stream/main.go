@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
+	"sync"
 	"time"
 )
 
@@ -19,10 +21,10 @@ func main() {
 func delegateWrapper() {
 	fmt.Printf("%s\n", "Start Stream Delegate Wrapper")
 	defer fmt.Printf("End\n")
-	st := Make()
+	st := NewCounter()
 	defer st.Close()
 	for i := 0; i < 5; i++ {
-		if err := st.Send(i); err != nil {
+		if err := st.Write(i); err != nil {
 			fmt.Printf("err = %+v\n", err)
 			return
 		}
@@ -35,10 +37,10 @@ func delegateWrapperWithTimeout() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*25)
 	defer cancel()
-	st := Make()
+	st := NewCounter()
 	defer st.Close()
 	for i := 0; i < 5; i++ {
-		if err := st.SendContext(ctx, i); err != nil {
+		if err := st.WriteContext(ctx, i); err != nil {
 			return
 		}
 	}
@@ -142,38 +144,43 @@ func startDelegate() (chan int, <-chan struct{}) {
 }
 
 func startDelegateWrapper() Stream {
-	return Make()
+	return NewCounter()
 }
 
-// write channelのWrapperと割り切る
-// stopの後のsendはpanic
-// 原則、writeとstopは同じスコープで扱うことを前提とする（= write channel と同じお作法）
 type Stream struct {
+	sync.Mutex
+
 	inCh   chan int
+	once   sync.Once
 	doneCh chan struct{}
 }
 
-func (s Stream) Send(num int) error {
-	s.inCh <- num
-	return nil
+func (s *Stream) Write(num int) error {
+	return s.WriteContext(context.Background(), num)
 }
 
-func (s Stream) SendContext(ctx context.Context, num int) error {
+func (s *Stream) WriteContext(ctx context.Context, num int) error {
 	select {
 	case <-ctx.Done():
 		return context.Canceled
+	case <-s.doneCh:
+		return io.EOF
 	case s.inCh <- num:
+		// io.Pipe方式ならackChを返す
 	}
 	return nil
 }
 
-func (s Stream) Close() {
+func (s *Stream) Close() {
 	// 必ずchをクローズしてからdoneを待つ
-	close(s.inCh)
-	<-s.doneCh
+	s.once.Do(func() {
+		// 非同期にして全部とりきる方式なら
+		close(s.inCh)
+		<-s.doneCh
+	})
 }
 
-func Make() Stream {
+func NewCounter() Stream {
 	intCh := make(chan int, 0)
 	doneCh := make(chan struct{}, 0)
 	go func() {
